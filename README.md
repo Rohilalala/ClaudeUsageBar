@@ -4,9 +4,9 @@
 
 # ClaudeUsageBar
 
-### See your Claude AI usage limits live in the macOS menu bar
+### See your Claude AI — and ChatGPT Codex — usage limits live in the macOS menu bar
 
-Track your **Claude 5-hour limit** and **weekly limit** at a glance — no more opening settings, refreshing the page, or getting surprised by a "you've reached your usage limit" message mid-prompt.
+Track your **Claude 5-hour limit** and **weekly limit** (and optionally your **ChatGPT Codex limits**) at a glance — no more opening settings, refreshing the page, or getting surprised by a "you've reached your usage limit" message mid-prompt.
 
 [![Download .dmg](https://img.shields.io/github/v/release/Rohilalala/ClaudeUsageBar?label=Download%20.dmg&color=D97757)](https://github.com/Rohilalala/ClaudeUsageBar/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-black?logo=apple)](#install)
@@ -18,7 +18,7 @@ Track your **Claude 5-hour limit** and **weekly limit** at a glance — no more 
 
 ---
 
-> **TL;DR** — A tiny native macOS menu bar app + a browser extension. The extension reads your usage straight from your own logged-in Claude.ai session and shows it in your menu bar like `Claude 35%`. It turns **orange at 75%** and **red at 90%**, and pings you before you hit the wall.
+> **TL;DR** — A tiny native macOS menu bar app + a browser extension. The extension reads your usage straight from your own logged-in Claude.ai (and optionally chatgpt.com) session and shows it in your menu bar like `Claude 35%` or `Claude 35% · Codex 12%`. It turns **orange at 75%** and **red at 90%**, and pings you before you hit the wall.
 
 <div align="center">
 <img src="assets/screenshot.png" alt="ClaudeUsageBar showing Claude 5-hour and weekly usage in the macOS menu bar" width="380" />
@@ -31,7 +31,9 @@ If you use **Claude**, **Claude Code**, or the **Claude Max / Pro** plans, you l
 ## Features
 
 - 📊 **5-hour + weekly usage** — both Claude limits, live in the menu bar (`Claude 35%`).
+- 🤖 **ChatGPT Codex too** *(new in 1.1)* — optionally track your ChatGPT Codex 5-hour and weekly limits alongside Claude: `Claude 35% · Codex 12%`.
 - 🎨 **Color warnings** — title goes **orange at 75%**, **red at 90%**. Glanceable.
+- 🖌️ **Per-provider title colors** *(new in 1.1)* — pick a palette color per provider (defaults: Claude orange, Codex green); warning colors still take over near the limit.
 - 🔔 **Threshold notifications** — a macOS alert when any limit crosses 90%, so you can wrap up before you're cut off.
 - ⏰ **Reset countdown + alarm** — see exactly when your 5-hour window resets, with an optional alarm at reset time.
 - 🔕 **Pick your sound** — choose any macOS system sound for alerts (hover to preview).
@@ -77,7 +79,7 @@ Works in any Chromium browser — **Chrome, Edge, Brave, Arc**.
 2. Open `chrome://extensions`.
 3. Turn on **Developer mode** (top-right).
 4. Click **Load unpacked** and select that **Extension** folder.
-5. Open or reload a logged-in [claude.ai](https://claude.ai) tab.
+5. Open or reload a logged-in [claude.ai](https://claude.ai) tab. For Codex usage, also keep a logged-in [chatgpt.com](https://chatgpt.com) tab open.
 
 That's it. The menu bar starts updating within a minute.
 
@@ -87,22 +89,31 @@ Click the menu bar item for the full breakdown:
 
 ```
 Sync usage with Claude.ai
+Sync usage with ChatGPT
 ───────────────
-5-hour:  35% used
+Claude 5-hour:  35% used
 Resets 2:43 PM (in 3h 28m)
-───────────────
-Weekly:  32% used
+Claude weekly:  32% used
 Resets Mon 8:30 PM
+───────────────
+Codex 5-hour:  12% used
+Resets 4:10 PM (in 4h 55m)
+Codex weekly:  8% used
+Resets Thu 11:00 AM
 ───────────────
 Updated 12s ago
 ───────────────
 Settings ▸
-  Show 5-hour in title
-  Show weekly in title
-  Show "Claude" label
+  Show Claude 5-hour in title
+  Show Claude weekly in title
+  Show Codex 5-hour in title
+  Show Codex weekly in title
+  Show provider labels
   Show "Resets at" label
   Show reset countdown
   Alarm at 5-hour reset
+  Claude color ▸
+  Codex color ▸
   Notification sound ▸
   ─────────────
   Start at login
@@ -110,22 +121,24 @@ Settings ▸
 Quit
 ```
 
-- **Color coding** — orange ≥ 75%, red ≥ 90%, based on the highest figure shown.
+- **Color coding** — each provider's segment uses its own color (orange for Claude, green for Codex by default, or any palette color you pick), overridden by **orange ≥ 75%** / **red ≥ 90%** based on that provider's own figures.
 - **At 100%** the 5-hour title flips to the reset time, e.g. `Claude Resets at 2:40 PM`.
-- **Minimal mode** — turn off *Show "Claude" label* for a bare `35%`, or show both figures for `35% / 32%`.
+- **Minimal mode** — turn off *Show provider labels* for a bare `35%`, or show both figures for `35% / 32%`.
 
-You only need a logged-in claude.ai tab open *somewhere* — the Settings/Usage page does **not** have to be open. The extension polls about once a minute and keeps the menu bar fresh on its own.
+You only need a logged-in claude.ai tab open *somewhere* — the Settings/Usage page does **not** have to be open. Same for chatgpt.com if you track Codex. The extension polls about once a minute and keeps the menu bar fresh on its own.
 
 ## How it works
 
 ```
-claude.ai usage API  →  content.js  →  background.js  →  127.0.0.1:8787  →  Swift app
-  (/api/.../usage)       (poll+map)     (relay POST)       (loopback)        (menu bar)
+claude.ai usage API   →  content.js          ⎫
+  (/api/.../usage)        (poll+map)          ⎬→  background.js  →  127.0.0.1:8787  →  Swift app
+chatgpt.com wham API  →  content-chatgpt.js  ⎭     (relay POST)      (loopback)        (menu bar)
+  (/backend-api/wham/usage)  (poll+map)
 ```
 
-1. `content.js` polls Claude.ai's own usage API (`/api/organizations/:id/usage`) from your logged-in tab.
-2. `background.js` relays the result as JSON to the local app.
-3. The Swift app runs a minimal HTTP server bound to `127.0.0.1:8787` **only** and renders the figures.
+1. `content.js` polls Claude.ai's own usage API (`/api/organizations/:id/usage`) from your logged-in tab; `content-chatgpt.js` does the same for Codex via chatgpt.com's `/backend-api/wham/usage` (the endpoint the Codex CLI itself polls).
+2. `background.js` relays the result as JSON to the local app, tagged per provider.
+3. The Swift app runs a minimal HTTP server bound to `127.0.0.1:8787` **only** and renders the figures. Staleness is tracked per provider — a closed chatgpt.com tab never marks your Claude figures stale.
 
 ## Privacy & security
 
@@ -133,7 +146,7 @@ ClaudeUsageBar is **fully local and client-side**:
 
 - Reads **your own** usage from **your own** logged-in session — no credentials stored, no login, no account.
 - Sends data **only** to `http://127.0.0.1:8787` on your machine. Nothing is uploaded anywhere.
-- The local server binds to **loopback only**, locks CORS to `https://claude.ai`, rejects mismatched `Host` headers (DNS-rebinding guard), caps request size, and sanitizes every field before it reaches the menu bar.
+- The local server binds to **loopback only**, locks CORS to `https://claude.ai` and `https://chatgpt.com`, rejects mismatched `Host` headers (DNS-rebinding guard), caps request size, and sanitizes every field before it reaches the menu bar.
 
 ## FAQ
 
@@ -142,6 +155,9 @@ Install ClaudeUsageBar — it shows your remaining 5-hour and weekly Claude usag
 
 **Does this work with Claude Code and the Claude Max / Pro plans?**
 Yes. It reads whatever limits your account has (5-hour session + weekly), so it works across Claude.ai chat, Claude Code, Max, and Pro.
+
+**Can it track ChatGPT Codex usage too?**
+Yes (since 1.1). Keep a logged-in chatgpt.com tab open and toggle *Show Codex 5-hour / weekly in title* in Settings. It reads the same rate-limit endpoint the Codex CLI polls, so it works on Plus, Pro, and Team plans.
 
 **Is it safe / does it have my Claude password?**
 No password, no login, no data leaves your Mac. It only reads usage numbers from your already-logged-in browser session and shows them locally.
@@ -168,6 +184,8 @@ If the menu bar stops updating:
 2. Run `await (await fetch("/api/organizations")).json()`, then fetch `/api/organizations/<id>/usage` to see the current field names.
 3. Update the field references in `poll()`, then reload the extension at `chrome://extensions`.
 
+Codex works the same way in `Extension/content-chatgpt.js`: `/api/auth/session` → access token, then `GET /backend-api/wham/usage` → `rate_limit.primary_window` (5-hour) and `secondary_window` (weekly), fields `used_percent` / `reset_at`. The raw response shape is logged once at `console.debug` to make re-mapping easy.
+
 ## Contributing
 
 Issues and PRs welcome. The whole thing is ~600 lines of Swift + ~150 lines of JavaScript, no build system beyond `swiftc`.
@@ -182,4 +200,4 @@ Unofficial project. **Not affiliated with, endorsed by, or supported by Anthropi
 
 ---
 
-**Keywords:** Claude usage menu bar, Claude AI usage tracker for Mac, Claude Code usage monitor, Claude 5-hour limit, Claude weekly limit tracker, Claude Max / Pro usage, macOS menu bar Claude rate limit, see how much Claude usage is left.
+**Keywords:** Claude usage menu bar, Claude AI usage tracker for Mac, Claude Code usage monitor, Claude 5-hour limit, Claude weekly limit tracker, Claude Max / Pro usage, macOS menu bar Claude rate limit, ChatGPT Codex usage tracker, Codex rate limit monitor, see how much Claude usage is left.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ClaudeUsageBar",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reads your Claude.ai and ChatGPT Codex usage figures from your own logged-in sessions and relays them to the ClaudeUsageBar menu bar app over localhost.",
   "permissions": ["scripting"],
   "host_permissions": [

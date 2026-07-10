@@ -53,13 +53,16 @@ ejected.
 - Turn on "Developer mode" (top right).
 - Click "Load unpacked" and select the Extension folder you just copied.
 - Open or reload a logged-in https://claude.ai tab.
+- Optional: to also track ChatGPT Codex usage, keep a logged-in
+  https://chatgpt.com tab open and enable the Codex title toggles in Settings.
 
 
 That's it
 ---------
 The menu bar starts updating within a minute. It reads your usage from your own
-logged-in claude.ai session and sends it only to 127.0.0.1 on your own machine.
-Keep one claude.ai tab open; the usage settings page does NOT need to be open.
+logged-in claude.ai (and optionally chatgpt.com) session and sends it only to
+127.0.0.1 on your own machine. Keep one claude.ai tab open; the usage settings
+page does NOT need to be open.
 
 To start the app automatically at login: menu bar icon > Settings > Start at
 login (works best once the app lives in /Applications).
