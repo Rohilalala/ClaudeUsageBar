@@ -22,6 +22,8 @@ private let kNotificationSound = "notificationSound"
 private let kShowCodexFiveHour = "showCodexFiveHourInTitle"
 private let kShowCodexWeekly = "showCodexWeeklyInTitle"
 private let kCodexVersionId = "codexVersionId"
+private let kClaudeTitleColor = "claudeTitleColor"
+private let kCodexTitleColor = "codexTitleColor"
 
 // MARK: - Shared state
 
@@ -154,6 +156,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"
     ]
 
+    // Title colours per provider. "Brand" is the provider's own colour, "System"
+    // is the plain menu bar colour. Warn/crit colouring still overrides these.
+    private static let claudeBrandColor = NSColor(srgbRed: 217/255, green: 119/255, blue: 87/255, alpha: 1)  // #D97757
+    private static let codexBrandColor = NSColor(srgbRed: 16/255, green: 163/255, blue: 127/255, alpha: 1)   // #10A37F
+    private let colorChoices: [(name: String, color: NSColor?)] = [
+        ("Red", .systemRed), ("Orange", .systemOrange), ("Yellow", .systemYellow),
+        ("Green", .systemGreen), ("Mint", .systemMint), ("Teal", .systemTeal),
+        ("Cyan", .systemCyan), ("Blue", .systemBlue), ("Indigo", .systemIndigo),
+        ("Purple", .systemPurple), ("Pink", .systemPink), ("Brown", .systemBrown),
+        ("Gray", .systemGray)
+    ]
+
     private var notificationsAuthorized = false
     private var scheduledResetAlarm = ""
     private var lastFivePercent: Int? // nil until the first reading, to avoid
@@ -185,6 +199,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     private var showCodexFiveItem: NSMenuItem!
     private var showCodexWeeklyItem: NSMenuItem!
     private var showClaudeItem: NSMenuItem!
+    private var claudeColorMenu: NSMenu!
+    private var codexColorMenu: NSMenu!
     private var showResetsAtItem: NSMenuItem!
     private var showResetCountdownItem: NSMenuItem!
     private var resetAlarmItem: NSMenuItem!
@@ -206,7 +222,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             kShowResetCountdown: false,
             kAlarmAtFiveHourReset: false,
             kNotificationSound: "Default",
-            kCodexVersionId: ""
+            kCodexVersionId: "",
+            kClaudeTitleColor: "Brand",
+            kCodexTitleColor: "Brand"
         ])
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -301,6 +319,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         resetAlarmItem.target = self
         submenu.addItem(resetAlarmItem)
 
+        let claudeColorItem = NSMenuItem(title: "Claude color", action: nil, keyEquivalent: "")
+        claudeColorMenu = buildColorMenu(brand: AppDelegate.claudeBrandColor, action: #selector(selectClaudeColor))
+        claudeColorItem.submenu = claudeColorMenu
+        submenu.addItem(claudeColorItem)
+
+        let codexColorItem = NSMenuItem(title: "Codex color", action: nil, keyEquivalent: "")
+        codexColorMenu = buildColorMenu(brand: AppDelegate.codexBrandColor, action: #selector(selectCodexColor))
+        codexColorItem.submenu = codexColorMenu
+        submenu.addItem(codexColorItem)
+
         let soundItem = NSMenuItem(title: "Notification sound", action: nil, keyEquivalent: "")
         let soundMenu = NSMenu()
         soundMenu.delegate = self
@@ -334,6 +362,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         statusItem.menu = menu
     }
 
+    /// One palette submenu: the provider's brand colour, the plain system
+    /// colour, then the named system colours. Each item carries a swatch.
+    private func buildColorMenu(brand: NSColor, action: Selector) -> NSMenu {
+        let menu = NSMenu()
+        func add(_ name: String, _ color: NSColor?, title: String) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            item.image = swatchImage(color)
+            menu.addItem(item)
+        }
+        add("Brand", brand, title: "Brand default")
+        add("System", nil, title: "System")
+        menu.addItem(.separator())
+        for choice in colorChoices { add(choice.name, choice.color, title: choice.name) }
+        return menu
+    }
+
+    private func swatchImage(_ color: NSColor?) -> NSImage {
+        let size = NSSize(width: 14, height: 14)
+        return NSImage(size: size, flipped: false) { rect in
+            let path = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+            (color ?? .labelColor).setFill()
+            path.fill()
+            NSColor.tertiaryLabelColor.setStroke()
+            path.stroke()
+            return true
+        }
+    }
+
+    /// The stored title colour for a provider: nil means the plain system colour.
+    private func providerColor(forKey key: String, brand: NSColor) -> NSColor? {
+        let name = UserDefaults.standard.string(forKey: key) ?? "Brand"
+        if name == "System" { return nil }
+        if name == "Brand" { return brand }
+        return colorChoices.first(where: { $0.name == name })?.color ?? brand
+    }
+
+    private func updateColorMenuChecks(menu: NSMenu, key: String) {
+        let selected = UserDefaults.standard.string(forKey: key) ?? "Brand"
+        for item in menu.items {
+            guard let name = item.representedObject as? String else { continue }
+            item.state = name == selected ? .on : .off
+        }
+    }
+
     /// The Codex metrics to display: the selected model lane when one is chosen
     /// and present in the latest payload, else the account-wide window.
     private func effectiveCodex(_ s: Snapshot) -> (fiveHour: Metric, weekly: Metric) {
@@ -358,8 +432,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let codex = effectiveCodex(s)
 
         // Title: one segment per provider, joined with a dot. A stale provider
-        // shows "(stale)" without dragging the other one down with it.
-        var shownPercents: [Int] = []
+        // shows "(stale)" without dragging the other one down with it. Each
+        // segment gets its provider's colour; warn/crit colouring overrides it
+        // per segment based on that provider's own figures.
+        var claudePercents: [Int] = []
 
         var claudeParts: [String] = []
         if !s.claudeStale {
@@ -372,23 +448,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                 } else {
                     claudeParts.append(s.claude.fiveHour.value)
                 }
-                if let p = percent(s.claude.fiveHour.value) { shownPercents.append(p) }
+                if let p = percent(s.claude.fiveHour.value) { claudePercents.append(p) }
             }
             if showWeekly, !s.claude.weekly.value.isEmpty {
                 claudeParts.append(s.claude.weekly.value + (showFive ? "" : " wk"))
-                if let p = percent(s.claude.weekly.value) { shownPercents.append(p) }
+                if let p = percent(s.claude.weekly.value) { claudePercents.append(p) }
             }
         }
 
+        var codexPercents: [Int] = []
         var codexParts: [String] = []
         if !s.codexStale {
             if showCodexFive, !codex.fiveHour.value.isEmpty {
                 codexParts.append(codex.fiveHour.value)
-                if let p = percent(codex.fiveHour.value) { shownPercents.append(p) }
+                if let p = percent(codex.fiveHour.value) { codexPercents.append(p) }
             }
             if showCodexWeekly, !codex.weekly.value.isEmpty {
                 codexParts.append(codex.weekly.value + (showCodexFive ? "" : " wk"))
-                if let p = percent(codex.weekly.value) { shownPercents.append(p) }
+                if let p = percent(codex.weekly.value) { codexPercents.append(p) }
             }
         }
 
@@ -400,22 +477,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             return prefix + parts.joined(separator: " / ")
         }
 
-        let segments = [
-            segment(label: "Claude", parts: claudeParts, stale: s.claudeStale, anyShown: showFive || showWeekly),
-            segment(label: "Codex", parts: codexParts, stale: s.codexStale, anyShown: showCodexFive || showCodexWeekly)
-        ].compactMap { $0 }
+        let claudeColor = providerColor(forKey: kClaudeTitleColor, brand: AppDelegate.claudeBrandColor)
+        let codexColor = providerColor(forKey: kCodexTitleColor, brand: AppDelegate.codexBrandColor)
+
+        var segments: [(text: String, color: NSColor?)] = []
+        if let text = segment(label: "Claude", parts: claudeParts, stale: s.claudeStale, anyShown: showFive || showWeekly) {
+            segments.append((text, warnColor(forPercent: claudePercents.max()) ?? claudeColor))
+        }
+        if let text = segment(label: "Codex", parts: codexParts, stale: s.codexStale, anyShown: showCodexFive || showCodexWeekly) {
+            segments.append((text, warnColor(forPercent: codexPercents.max()) ?? codexColor))
+        }
 
         if segments.isEmpty {
             statusItem.button?.title = showLabels ? "Claude --" : "--"
         } else {
-            let title = segments.joined(separator: " · ")
-            // Colour by the highest figure shown: orange when warm, red when high.
-            if let color = warnColor(forPercent: shownPercents.max()) {
-                statusItem.button?.attributedTitle =
-                    NSAttributedString(string: title, attributes: [.foregroundColor: color])
-            } else {
-                statusItem.button?.title = title // plain colour
+            let title = NSMutableAttributedString()
+            for (index, seg) in segments.enumerated() {
+                if index > 0 { title.append(NSAttributedString(string: " · ")) }
+                var attrs: [NSAttributedString.Key: Any] = [:]
+                if let color = seg.color { attrs[.foregroundColor] = color }
+                title.append(NSAttributedString(string: seg.text, attributes: attrs))
             }
+            statusItem.button?.attributedTitle = title
         }
 
         // Fire a notification if any figure just crossed the red line.
@@ -441,6 +524,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         showCodexFiveItem.state = showCodexFive ? .on : .off
         showCodexWeeklyItem.state = showCodexWeekly ? .on : .off
         showClaudeItem.state = showLabels ? .on : .off
+        updateColorMenuChecks(menu: claudeColorMenu, key: kClaudeTitleColor)
+        updateColorMenuChecks(menu: codexColorMenu, key: kCodexTitleColor)
         showResetsAtItem.state = showResetsAt ? .on : .off
         showResetCountdownItem.state = showResetCountdown ? .on : .off
         resetAlarmItem.state = resetAlarmEnabled ? .on : .off
@@ -689,6 +774,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     @objc private func selectCodexVersion(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         UserDefaults.standard.set(id, forKey: kCodexVersionId)
+        render()
+    }
+
+    @objc private func selectClaudeColor(_ sender: NSMenuItem) {
+        setTitleColor(sender, key: kClaudeTitleColor)
+    }
+
+    @objc private func selectCodexColor(_ sender: NSMenuItem) {
+        setTitleColor(sender, key: kCodexTitleColor)
+    }
+
+    private func setTitleColor(_ sender: NSMenuItem, key: String) {
+        guard let name = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(name, forKey: key)
         render()
     }
 
