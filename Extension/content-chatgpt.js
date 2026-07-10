@@ -57,12 +57,15 @@ if (document.documentElement.dataset.claudeUsageBarCodex === "active") {
     pct = Math.round(pct);
 
     let resetDate = null;
-    if (typeof node.resets_in_seconds === "number") {
-      resetDate = new Date(Date.now() + node.resets_in_seconds * 1000);
-    } else if (typeof node.resets_at === "number") {
-      resetDate = new Date(node.resets_at * 1000); // unix seconds
-    } else if (typeof node.resets_at === "string") {
-      resetDate = new Date(node.resets_at); // ISO8601
+    const resetAt = node.reset_at != null ? node.reset_at : node.resets_at;
+    const resetAfter = typeof node.reset_after_seconds === "number"
+      ? node.reset_after_seconds : node.resets_in_seconds;
+    if (typeof resetAt === "number") {
+      resetDate = new Date(resetAt * 1000); // unix seconds
+    } else if (typeof resetAt === "string") {
+      resetDate = new Date(resetAt); // ISO8601
+    } else if (typeof resetAfter === "number") {
+      resetDate = new Date(Date.now() + resetAfter * 1000);
     }
     if (resetDate && isNaN(resetDate.getTime())) resetDate = null;
 
@@ -130,8 +133,8 @@ if (document.documentElement.dataset.claudeUsageBarCodex === "active") {
       const mFive = parseWindow(erl.primary_window, clockReset);
       const mWeekly = parseWindow(erl.secondary_window, weekdayReset);
       if (!mFive && !mWeekly) continue;
-      const label = entry.label || entry.name || entry.model || entry.slug || "Model";
-      const id = String(entry.id || entry.slug || entry.model || label);
+      const label = entry.limit_name || entry.label || entry.name || entry.model || "Model";
+      const id = String(entry.metered_feature || entry.id || entry.limit_name || label);
       const model = { id, label: String(label) };
       if (mFive) model.five_hour = mFive;
       if (mWeekly) model.weekly = mWeekly;
