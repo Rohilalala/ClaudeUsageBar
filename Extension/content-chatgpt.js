@@ -14,7 +14,6 @@
 // The shapes consumed below are:
 //   rate_limit.primary_window    -> 5-hour lane
 //   rate_limit.secondary_window  -> weekly lane
-//   additional_rate_limits[]     -> model-specific lanes (e.g. Codex Spark)
 // Field names inside a window vary across deployments, so parsing tolerates
 // both { used_percent | utilization } and { resets_at | resets_in_seconds |
 // resets_at_unix }. If a field disappears entirely, update parseWindow().
@@ -121,28 +120,7 @@ if (document.documentElement.dataset.claudeUsageBarCodex === "active") {
     const weekly = parseWindow(rl.secondary_window, weekdayReset);
     if (five) payload.five_hour = five;
     if (weekly) payload.weekly = weekly;
-
-    // Model-specific lanes, e.g. GPT-5.3-Codex-Spark. Capped to keep the menu
-    // (and the local payload) bounded.
-    const extra = Array.isArray(usage.additional_rate_limits)
-      ? usage.additional_rate_limits : [];
-    const models = [];
-    for (const entry of extra.slice(0, 10)) {
-      if (!entry || typeof entry !== "object") continue;
-      const erl = entry.rate_limit || entry.rate_limits || entry;
-      const mFive = parseWindow(erl.primary_window, clockReset);
-      const mWeekly = parseWindow(erl.secondary_window, weekdayReset);
-      if (!mFive && !mWeekly) continue;
-      const label = entry.limit_name || entry.label || entry.name || entry.model || "Model";
-      const id = String(entry.metered_feature || entry.id || entry.limit_name || label);
-      const model = { id, label: String(label) };
-      if (mFive) model.five_hour = mFive;
-      if (mWeekly) model.weekly = mWeekly;
-      models.push(model);
-    }
-    if (models.length) payload.models = models;
-
-    if (!payload.five_hour && !payload.weekly && !payload.models) return;
+    if (!payload.five_hour && !payload.weekly) return;
 
     // Send on every poll (not just on change) so the app's staleness tracking
     // stays accurate while we are polling fine.

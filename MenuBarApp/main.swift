@@ -21,7 +21,6 @@ private let kAlarmAtFiveHourReset = "alarmAtFiveHourReset"
 private let kNotificationSound = "notificationSound"
 private let kShowCodexFiveHour = "showCodexFiveHourInTitle"
 private let kShowCodexWeekly = "showCodexWeeklyInTitle"
-private let kCodexVersionId = "codexVersionId"
 private let kClaudeTitleColor = "claudeTitleColor"
 private let kCodexTitleColor = "codexTitleColor"
 
@@ -42,19 +41,10 @@ private struct ProviderUsage {
     var lastUpdate: Date? // nil until the first figure arrives
 }
 
-/// One model-specific Codex limit lane (from additional_rate_limits).
-private struct CodexModel {
-    let id: String
-    let label: String
-    let fiveHour: Metric
-    let weekly: Metric
-}
-
 /// A consistent snapshot for rendering.
 private struct Snapshot {
     let claude: ProviderUsage
     let codex: ProviderUsage
-    let codexModels: [CodexModel]
     let claudeStale: Bool
     let codexStale: Bool
     let lastUpdate: Date? // most recent update from either provider
@@ -68,7 +58,6 @@ final class UsageState {
     private let queue = DispatchQueue(label: "com.claudeusagebar.state")
     private var claude = ProviderUsage()
     private var codex = ProviderUsage()
-    private var codexModels: [CodexModel] = []
 
     /// Applies a Claude usage update. Nil groups are left unchanged. Values are
     /// treated as untrusted: control characters are stripped and length is
@@ -82,20 +71,12 @@ final class UsageState {
         }
     }
 
-    /// Applies a Codex usage update. The model list is replaced wholesale —
-    /// the extension sends the full list on every poll.
-    func updateCodex(fiveHour: Group?, weekly: Group?,
-                     models: [(id: String, label: String, fiveHour: Group?, weekly: Group?)]) {
-        guard fiveHour != nil || weekly != nil || !models.isEmpty else { return }
+    /// Applies a Codex usage update.
+    func updateCodex(fiveHour: Group?, weekly: Group?) {
+        guard fiveHour != nil || weekly != nil else { return }
         queue.sync {
             if let f = fiveHour { codex.fiveHour = UsageState.metric(f) }
             if let w = weekly { codex.weekly = UsageState.metric(w) }
-            codexModels = models.prefix(10).map {
-                CodexModel(id: UsageState.sanitize($0.id),
-                           label: UsageState.sanitize($0.label),
-                           fiveHour: $0.fiveHour.map(UsageState.metric) ?? Metric(),
-                           weekly: $0.weekly.map(UsageState.metric) ?? Metric())
-            }
             codex.lastUpdate = Date()
         }
     }
@@ -106,7 +87,7 @@ final class UsageState {
                 date.map { Date().timeIntervalSince($0) > 600 } ?? false
             }
             let last = [claude.lastUpdate, codex.lastUpdate].compactMap { $0 }.max()
-            return Snapshot(claude: claude, codex: codex, codexModels: codexModels,
+            return Snapshot(claude: claude, codex: codex,
                             claudeStale: stale(claude.lastUpdate),
                             codexStale: stale(codex.lastUpdate),
                             lastUpdate: last)
@@ -191,8 +172,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     private var codexFiveResetItem: NSMenuItem!
     private var codexWeeklyDetailItem: NSMenuItem!
     private var codexWeeklyResetItem: NSMenuItem!
-    private var codexVersionMenu: NSMenu!
-    private var codexVersionMenuIds: [String] = []
     private var updatedItem: NSMenuItem!
     private var showFiveItem: NSMenuItem!
     private var showWeeklyItem: NSMenuItem!
@@ -222,7 +201,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             kShowResetCountdown: false,
             kAlarmAtFiveHourReset: false,
             kNotificationSound: "Default",
-            kCodexVersionId: "",
             kClaudeTitleColor: "Brand",
             kCodexTitleColor: "Brand"
         ])
@@ -272,13 +250,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         menu.addItem(codexWeeklyDetailItem)
         codexWeeklyResetItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         menu.addItem(codexWeeklyResetItem)
-
-        // Which Codex limit lane to display: the account-wide window, or a
-        // model-specific one. Model items are rebuilt as payloads arrive.
-        let codexVersionItem = NSMenuItem(title: "Codex version", action: nil, keyEquivalent: "")
-        codexVersionMenu = NSMenu()
-        codexVersionItem.submenu = codexVersionMenu
-        menu.addItem(codexVersionItem)
 
         menu.addItem(.separator())
 
@@ -408,16 +379,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         }
     }
 
-    /// The Codex metrics to display: the selected model lane when one is chosen
-    /// and present in the latest payload, else the account-wide window.
-    private func effectiveCodex(_ s: Snapshot) -> (fiveHour: Metric, weekly: Metric) {
-        let selected = UserDefaults.standard.string(forKey: kCodexVersionId) ?? ""
-        if !selected.isEmpty, let m = s.codexModels.first(where: { $0.id == selected }) {
-            return (m.fiveHour, m.weekly)
-        }
-        return (s.codex.fiveHour, s.codex.weekly)
-    }
-
     private func render() {
         let s = state.snapshot
         let defaults = UserDefaults.standard
@@ -429,7 +390,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let showResetsAt = defaults.bool(forKey: kShowResetsAtLabel)
         let showResetCountdown = defaults.bool(forKey: kShowResetCountdown)
         let resetAlarmEnabled = defaults.bool(forKey: kAlarmAtFiveHourReset)
-        let codex = effectiveCodex(s)
+        let codex = s.codex
 
         // Title: one segment per provider, joined with a dot. A stale provider
         // shows "(stale)" without dragging the other one down with it. Each
@@ -502,7 +463,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         }
 
         // Fire a notification if any figure just crossed the red line.
-        checkThresholds(s, codex: codex)
+        checkThresholds(s)
         updateResetAlarm(reset: s.claude.fiveHour.reset, enabled: resetAlarmEnabled)
 
         // Detail lines.
@@ -515,8 +476,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         codexWeeklyDetailItem.title = codex.weekly.detail.isEmpty ? "Codex weekly: no data yet" : "Codex weekly: \(codex.weekly.detail)"
         codexWeeklyResetItem.title = resetLine(codex.weekly.reset, clock: false)
         updatedItem.title = "Updated " + ago(s.lastUpdate)
-
-        updateCodexVersionMenu(models: s.codexModels)
 
         // Settings checkmarks.
         showFiveItem.state = showFive ? .on : .off
@@ -537,34 +496,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             item.state = SMAppService.mainApp.status == .enabled ? .on : .off
         }
         configureRenderTimer()
-    }
-
-    /// Rebuilds the Codex version submenu when the model list changes, and
-    /// keeps the checkmark on the stored selection (falling back to the
-    /// account lane when the selected model is absent from the payload).
-    private func updateCodexVersionMenu(models: [CodexModel]) {
-        let ids = models.map { $0.id }
-        if ids != codexVersionMenuIds {
-            codexVersionMenuIds = ids
-            codexVersionMenu.removeAllItems()
-            let account = NSMenuItem(title: "Account limit", action: #selector(selectCodexVersion), keyEquivalent: "")
-            account.target = self
-            account.representedObject = ""
-            codexVersionMenu.addItem(account)
-            if !models.isEmpty { codexVersionMenu.addItem(.separator()) }
-            for model in models {
-                let item = NSMenuItem(title: model.label, action: #selector(selectCodexVersion), keyEquivalent: "")
-                item.target = self
-                item.representedObject = model.id
-                codexVersionMenu.addItem(item)
-            }
-        }
-        let selected = UserDefaults.standard.string(forKey: kCodexVersionId) ?? ""
-        let selectionPresent = ids.contains(selected)
-        for item in codexVersionMenu.items {
-            guard let id = item.representedObject as? String else { continue }
-            item.state = (id == selected && selectionPresent) || (id.isEmpty && !selectionPresent) ? .on : .off
-        }
     }
 
     private func configureRenderTimer() {
@@ -689,11 +620,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     /// Notifies once when a figure crosses the critical line upward. The first
     /// reading only establishes a baseline so a relaunch at an already-high figure
     /// does not spam a notification.
-    private func checkThresholds(_ s: Snapshot, codex: (fiveHour: Metric, weekly: Metric)) {
+    private func checkThresholds(_ s: Snapshot) {
         maybeNotify(provider: "Claude", label: "5-hour", pct: percent(s.claude.fiveHour.value), last: &lastFivePercent)
         maybeNotify(provider: "Claude", label: "Weekly", pct: percent(s.claude.weekly.value), last: &lastWeeklyPercent)
-        maybeNotify(provider: "Codex", label: "5-hour", pct: percent(codex.fiveHour.value), last: &lastCodexFivePercent)
-        maybeNotify(provider: "Codex", label: "Weekly", pct: percent(codex.weekly.value), last: &lastCodexWeeklyPercent)
+        maybeNotify(provider: "Codex", label: "5-hour", pct: percent(s.codex.fiveHour.value), last: &lastCodexFivePercent)
+        maybeNotify(provider: "Codex", label: "Weekly", pct: percent(s.codex.weekly.value), last: &lastCodexWeeklyPercent)
     }
 
     private func maybeNotify(provider: String, label: String, pct: Int?, last: inout Int?) {
@@ -768,12 +699,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     @objc private func toggleCodexWeekly() {
         let defaults = UserDefaults.standard
         defaults.set(!defaults.bool(forKey: kShowCodexWeekly), forKey: kShowCodexWeekly)
-        render()
-    }
-
-    @objc private func selectCodexVersion(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(id, forKey: kCodexVersionId)
         render()
     }
 
@@ -966,17 +891,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                 let weekly = group(json["weekly"])
                 var rendered = false
                 if provider == "codex" {
-                    var models: [(id: String, label: String, fiveHour: UsageState.Group?, weekly: UsageState.Group?)] = []
-                    if let arr = json["models"] as? [[String: Any]] {
-                        for m in arr.prefix(10) {
-                            guard let id = m["id"] as? String, let label = m["label"] as? String else { continue }
-                            let f = group(m["five_hour"])
-                            let w = group(m["weekly"])
-                            if f != nil || w != nil { models.append((id, label, f, w)) }
-                        }
-                    }
-                    if fiveHour != nil || weekly != nil || !models.isEmpty {
-                        state.updateCodex(fiveHour: fiveHour, weekly: weekly, models: models)
+                    if fiveHour != nil || weekly != nil {
+                        state.updateCodex(fiveHour: fiveHour, weekly: weekly)
                         rendered = true
                     }
                 } else if provider == "claude" {
