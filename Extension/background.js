@@ -11,15 +11,21 @@ const ENDPOINT = "http://127.0.0.1:8787/usage";
 // Re-inject into every open claude.ai tab so updates take effect without the
 // user having to reload each tab by hand.
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.tabs.query({ url: "https://claude.ai/*" }, (tabs) => {
-    for (const tab of tabs) {
-      if (tab.id == null) continue;
-      chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content.js"]
-      }).catch(() => { /* tab may be discarded or restricted; ignore */ });
-    }
-  });
+  const contentScripts = [
+    { url: "https://claude.ai/*", file: "content.js" },
+    { url: "https://chatgpt.com/*", file: "content-chatgpt.js" }
+  ];
+  for (const { url, file } of contentScripts) {
+    chrome.tabs.query({ url }, (tabs) => {
+      for (const tab of tabs) {
+        if (tab.id == null) continue;
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: [file]
+        }).catch(() => { /* tab may be discarded or restricted; ignore */ });
+      }
+    });
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

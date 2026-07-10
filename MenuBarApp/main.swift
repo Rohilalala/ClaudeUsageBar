@@ -19,6 +19,9 @@ private let kShowResetsAtLabel = "showResetsAtLabelInTitle"
 private let kShowResetCountdown = "showResetCountdownInTitle"
 private let kAlarmAtFiveHourReset = "alarmAtFiveHourReset"
 private let kNotificationSound = "notificationSound"
+private let kShowCodexFiveHour = "showCodexFiveHourInTitle"
+private let kShowCodexWeekly = "showCodexWeeklyInTitle"
+private let kCodexVersionId = "codexVersionId"
 
 // MARK: - Shared state
 
@@ -30,48 +33,86 @@ private struct Metric {
     var reset = ""
 }
 
-/// A consistent snapshot for rendering.
-private struct Snapshot {
+/// Usage figures for one provider (Claude or Codex).
+private struct ProviderUsage {
+    var fiveHour = Metric()
+    var weekly = Metric()
+    var lastUpdate: Date? // nil until the first figure arrives
+}
+
+/// One model-specific Codex limit lane (from additional_rate_limits).
+private struct CodexModel {
+    let id: String
+    let label: String
     let fiveHour: Metric
     let weekly: Metric
-    let lastUpdate: Date?
-    let stale: Bool
+}
+
+/// A consistent snapshot for rendering.
+private struct Snapshot {
+    let claude: ProviderUsage
+    let codex: ProviderUsage
+    let codexModels: [CodexModel]
+    let claudeStale: Bool
+    let codexStale: Bool
+    let lastUpdate: Date? // most recent update from either provider
 }
 
 /// Holds the latest usage figures. All access is serialized so the network
 /// callbacks and the main thread never race.
 final class UsageState {
-    private let queue = DispatchQueue(label: "com.claudeusagebar.state")
-    private var fiveHour = Metric()
-    private var weekly = Metric()
-    private var lastUpdate: Date? // nil until the first figure arrives
+    typealias Group = (value: String, detail: String, reset: String)
 
-    /// Applies a usage update. Nil groups are left unchanged. Values are treated
-    /// as untrusted: control characters are stripped and length is capped before
-    /// they ever reach the menu bar.
-    func update(fiveHour: (value: String, detail: String, reset: String)?,
-                weekly: (value: String, detail: String, reset: String)?) {
+    private let queue = DispatchQueue(label: "com.claudeusagebar.state")
+    private var claude = ProviderUsage()
+    private var codex = ProviderUsage()
+    private var codexModels: [CodexModel] = []
+
+    /// Applies a Claude usage update. Nil groups are left unchanged. Values are
+    /// treated as untrusted: control characters are stripped and length is
+    /// capped before they ever reach the menu bar.
+    func updateClaude(fiveHour: Group?, weekly: Group?) {
         guard fiveHour != nil || weekly != nil else { return }
         queue.sync {
-            if let f = fiveHour {
-                self.fiveHour = Metric(value: UsageState.sanitize(f.value),
-                                       detail: UsageState.sanitize(f.detail),
-                                       reset: UsageState.sanitize(f.reset))
+            if let f = fiveHour { claude.fiveHour = UsageState.metric(f) }
+            if let w = weekly { claude.weekly = UsageState.metric(w) }
+            claude.lastUpdate = Date()
+        }
+    }
+
+    /// Applies a Codex usage update. The model list is replaced wholesale —
+    /// the extension sends the full list on every poll.
+    func updateCodex(fiveHour: Group?, weekly: Group?,
+                     models: [(id: String, label: String, fiveHour: Group?, weekly: Group?)]) {
+        guard fiveHour != nil || weekly != nil || !models.isEmpty else { return }
+        queue.sync {
+            if let f = fiveHour { codex.fiveHour = UsageState.metric(f) }
+            if let w = weekly { codex.weekly = UsageState.metric(w) }
+            codexModels = models.prefix(10).map {
+                CodexModel(id: UsageState.sanitize($0.id),
+                           label: UsageState.sanitize($0.label),
+                           fiveHour: $0.fiveHour.map(UsageState.metric) ?? Metric(),
+                           weekly: $0.weekly.map(UsageState.metric) ?? Metric())
             }
-            if let w = weekly {
-                self.weekly = Metric(value: UsageState.sanitize(w.value),
-                                     detail: UsageState.sanitize(w.detail),
-                                     reset: UsageState.sanitize(w.reset))
-            }
-            lastUpdate = Date()
+            codex.lastUpdate = Date()
         }
     }
 
     fileprivate var snapshot: Snapshot {
         queue.sync {
-            let stale = lastUpdate.map { Date().timeIntervalSince($0) > 600 } ?? false
-            return Snapshot(fiveHour: fiveHour, weekly: weekly, lastUpdate: lastUpdate, stale: stale)
+            func stale(_ date: Date?) -> Bool {
+                date.map { Date().timeIntervalSince($0) > 600 } ?? false
+            }
+            let last = [claude.lastUpdate, codex.lastUpdate].compactMap { $0 }.max()
+            return Snapshot(claude: claude, codex: codex, codexModels: codexModels,
+                            claudeStale: stale(claude.lastUpdate),
+                            codexStale: stale(codex.lastUpdate),
+                            lastUpdate: last)
         }
+    }
+
+    private static func metric(_ g: Group) -> Metric {
+        Metric(value: sanitize(g.value), detail: sanitize(g.detail), reset: sanitize(g.reset))
     }
 
     private static func sanitize(_ s: String) -> String {
@@ -86,6 +127,7 @@ private struct HTTPRequest {
     let method: String
     let path: String
     let host: String
+    let origin: String
     let body: Data
 }
 
@@ -116,21 +158,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     private var scheduledResetAlarm = ""
     private var lastFivePercent: Int? // nil until the first reading, to avoid
     private var lastWeeklyPercent: Int? // notifying on launch for an existing high
+    private var lastCodexFivePercent: Int?
+    private var lastCodexWeeklyPercent: Int?
 
     // Hardening limits and allow lists.
     private let maxBodyBytes = 65536
     private let maxRequestBytes = 65536 + 8192 // body cap plus header slack
     private let allowedHosts: Set<String> = ["127.0.0.1:8787", "localhost:8787"]
-    private let allowedOrigin = "https://claude.ai"
+    private let allowedOrigins: Set<String> = ["https://claude.ai", "https://chatgpt.com"]
+    private let defaultOrigin = "https://claude.ai"
 
     private var statusItem: NSStatusItem!
     private var fiveDetailItem: NSMenuItem!
     private var fiveResetItem: NSMenuItem!
     private var weeklyDetailItem: NSMenuItem!
     private var weeklyResetItem: NSMenuItem!
+    private var codexFiveDetailItem: NSMenuItem!
+    private var codexFiveResetItem: NSMenuItem!
+    private var codexWeeklyDetailItem: NSMenuItem!
+    private var codexWeeklyResetItem: NSMenuItem!
+    private var codexVersionMenu: NSMenu!
+    private var codexVersionMenuIds: [String] = []
     private var updatedItem: NSMenuItem!
     private var showFiveItem: NSMenuItem!
     private var showWeeklyItem: NSMenuItem!
+    private var showCodexFiveItem: NSMenuItem!
+    private var showCodexWeeklyItem: NSMenuItem!
     private var showClaudeItem: NSMenuItem!
     private var showResetsAtItem: NSMenuItem!
     private var showResetCountdownItem: NSMenuItem!
@@ -146,11 +199,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         UserDefaults.standard.register(defaults: [
             kShowFiveHour: true,
             kShowWeekly: false,
+            kShowCodexFiveHour: false,
+            kShowCodexWeekly: false,
             kShowClaudeLabel: true,
             kShowResetsAtLabel: true,
             kShowResetCountdown: false,
             kAlarmAtFiveHourReset: false,
-            kNotificationSound: "Default"
+            kNotificationSound: "Default",
+            kCodexVersionId: ""
         ])
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -169,6 +225,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         open.target = self
         menu.addItem(open)
 
+        let openChatGPT = NSMenuItem(title: "Sync usage with ChatGPT", action: #selector(openChatGPTUsage), keyEquivalent: "")
+        openChatGPT.target = self
+        menu.addItem(openChatGPT)
+
         menu.addItem(.separator())
 
         // Display-only lines. Passing action: nil leaves them auto-disabled.
@@ -186,6 +246,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
         menu.addItem(.separator())
 
+        codexFiveDetailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        menu.addItem(codexFiveDetailItem)
+        codexFiveResetItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        menu.addItem(codexFiveResetItem)
+        codexWeeklyDetailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        menu.addItem(codexWeeklyDetailItem)
+        codexWeeklyResetItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        menu.addItem(codexWeeklyResetItem)
+
+        // Which Codex limit lane to display: the account-wide window, or a
+        // model-specific one. Model items are rebuilt as payloads arrive.
+        let codexVersionItem = NSMenuItem(title: "Codex version", action: nil, keyEquivalent: "")
+        codexVersionMenu = NSMenu()
+        codexVersionItem.submenu = codexVersionMenu
+        menu.addItem(codexVersionItem)
+
+        menu.addItem(.separator())
+
         updatedItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         menu.addItem(updatedItem)
 
@@ -194,14 +272,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         // Settings submenu: choose what appears in the menu bar title.
         let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        showFiveItem = NSMenuItem(title: "Show 5-hour in title", action: #selector(toggleFiveHour), keyEquivalent: "")
+        showFiveItem = NSMenuItem(title: "Show Claude 5-hour in title", action: #selector(toggleFiveHour), keyEquivalent: "")
         showFiveItem.target = self
         submenu.addItem(showFiveItem)
-        showWeeklyItem = NSMenuItem(title: "Show weekly in title", action: #selector(toggleWeekly), keyEquivalent: "")
+        showWeeklyItem = NSMenuItem(title: "Show Claude weekly in title", action: #selector(toggleWeekly), keyEquivalent: "")
         showWeeklyItem.target = self
         submenu.addItem(showWeeklyItem)
+        showCodexFiveItem = NSMenuItem(title: "Show Codex 5-hour in title", action: #selector(toggleCodexFiveHour), keyEquivalent: "")
+        showCodexFiveItem.target = self
+        submenu.addItem(showCodexFiveItem)
+        showCodexWeeklyItem = NSMenuItem(title: "Show Codex weekly in title", action: #selector(toggleCodexWeekly), keyEquivalent: "")
+        showCodexWeeklyItem.target = self
+        submenu.addItem(showCodexWeeklyItem)
 
-        showClaudeItem = NSMenuItem(title: "Show \"Claude\" label", action: #selector(toggleClaudeLabel), keyEquivalent: "")
+        showClaudeItem = NSMenuItem(title: "Show provider labels", action: #selector(toggleClaudeLabel), keyEquivalent: "")
         showClaudeItem.target = self
         submenu.addItem(showClaudeItem)
 
@@ -250,68 +334,113 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         statusItem.menu = menu
     }
 
+    /// The Codex metrics to display: the selected model lane when one is chosen
+    /// and present in the latest payload, else the account-wide window.
+    private func effectiveCodex(_ s: Snapshot) -> (fiveHour: Metric, weekly: Metric) {
+        let selected = UserDefaults.standard.string(forKey: kCodexVersionId) ?? ""
+        if !selected.isEmpty, let m = s.codexModels.first(where: { $0.id == selected }) {
+            return (m.fiveHour, m.weekly)
+        }
+        return (s.codex.fiveHour, s.codex.weekly)
+    }
+
     private func render() {
         let s = state.snapshot
         let defaults = UserDefaults.standard
         let showFive = defaults.bool(forKey: kShowFiveHour)
         let showWeekly = defaults.bool(forKey: kShowWeekly)
-        let showClaude = defaults.bool(forKey: kShowClaudeLabel)
+        let showCodexFive = defaults.bool(forKey: kShowCodexFiveHour)
+        let showCodexWeekly = defaults.bool(forKey: kShowCodexWeekly)
+        let showLabels = defaults.bool(forKey: kShowClaudeLabel)
         let showResetsAt = defaults.bool(forKey: kShowResetsAtLabel)
         let showResetCountdown = defaults.bool(forKey: kShowResetCountdown)
         let resetAlarmEnabled = defaults.bool(forKey: kAlarmAtFiveHourReset)
-        let label = showClaude ? "Claude " : "" // the "Claude" word, when enabled
+        let codex = effectiveCodex(s)
 
-        // Title.
-        if s.stale {
-            statusItem.button?.title = showClaude ? "Claude (stale)" : "(stale)"
-        } else {
-            var parts: [String] = []
-            var shownPercents: [Int] = []
-            if showFive, !s.fiveHour.value.isEmpty {
-                if let fivePercent = percent(s.fiveHour.value), fivePercent >= 100, !s.fiveHour.reset.isEmpty {
+        // Title: one segment per provider, joined with a dot. A stale provider
+        // shows "(stale)" without dragging the other one down with it.
+        var shownPercents: [Int] = []
+
+        var claudeParts: [String] = []
+        if !s.claudeStale {
+            if showFive, !s.claude.fiveHour.value.isEmpty {
+                if let fivePercent = percent(s.claude.fiveHour.value), fivePercent >= 100, !s.claude.fiveHour.reset.isEmpty {
                     let resetValue = showResetCountdown
-                        ? resetCountdown(toClock: s.fiveHour.reset) ?? s.fiveHour.reset
-                        : s.fiveHour.reset
-                    parts.append(showResetsAt ? "Resets at \(resetValue)" : resetValue)
+                        ? resetCountdown(toClock: s.claude.fiveHour.reset) ?? s.claude.fiveHour.reset
+                        : s.claude.fiveHour.reset
+                    claudeParts.append(showResetsAt ? "Resets at \(resetValue)" : resetValue)
                 } else {
-                    parts.append(s.fiveHour.value)
+                    claudeParts.append(s.claude.fiveHour.value)
                 }
-                if let p = percent(s.fiveHour.value) { shownPercents.append(p) }
+                if let p = percent(s.claude.fiveHour.value) { shownPercents.append(p) }
             }
-            if showWeekly, !s.weekly.value.isEmpty {
-                parts.append(s.weekly.value)
-                if let p = percent(s.weekly.value) { shownPercents.append(p) }
+            if showWeekly, !s.claude.weekly.value.isEmpty {
+                claudeParts.append(s.claude.weekly.value + (showFive ? "" : " wk"))
+                if let p = percent(s.claude.weekly.value) { shownPercents.append(p) }
             }
-            if parts.isEmpty {
-                statusItem.button?.title = showClaude ? "Claude --" : "--"
+        }
+
+        var codexParts: [String] = []
+        if !s.codexStale {
+            if showCodexFive, !codex.fiveHour.value.isEmpty {
+                codexParts.append(codex.fiveHour.value)
+                if let p = percent(codex.fiveHour.value) { shownPercents.append(p) }
+            }
+            if showCodexWeekly, !codex.weekly.value.isEmpty {
+                codexParts.append(codex.weekly.value + (showCodexFive ? "" : " wk"))
+                if let p = percent(codex.weekly.value) { shownPercents.append(p) }
+            }
+        }
+
+        func segment(label: String, parts: [String], stale: Bool, anyShown: Bool) -> String? {
+            guard anyShown else { return nil }
+            let prefix = showLabels ? label + " " : ""
+            if stale { return prefix + "(stale)" }
+            if parts.isEmpty { return prefix + "--" }
+            return prefix + parts.joined(separator: " / ")
+        }
+
+        let segments = [
+            segment(label: "Claude", parts: claudeParts, stale: s.claudeStale, anyShown: showFive || showWeekly),
+            segment(label: "Codex", parts: codexParts, stale: s.codexStale, anyShown: showCodexFive || showCodexWeekly)
+        ].compactMap { $0 }
+
+        if segments.isEmpty {
+            statusItem.button?.title = showLabels ? "Claude --" : "--"
+        } else {
+            let title = segments.joined(separator: " · ")
+            // Colour by the highest figure shown: orange when warm, red when high.
+            if let color = warnColor(forPercent: shownPercents.max()) {
+                statusItem.button?.attributedTitle =
+                    NSAttributedString(string: title, attributes: [.foregroundColor: color])
             } else {
-                var title = label + parts.joined(separator: " / ")
-                if parts.count == 1, showWeekly, !showFive { title += " wk" } // disambiguate weekly only
-                // Colour by the highest figure shown: orange when warm, red when high.
-                if let color = warnColor(forPercent: shownPercents.max()) {
-                    statusItem.button?.attributedTitle =
-                        NSAttributedString(string: title, attributes: [.foregroundColor: color])
-                } else {
-                    statusItem.button?.title = title // plain colour
-                }
+                statusItem.button?.title = title // plain colour
             }
         }
 
         // Fire a notification if any figure just crossed the red line.
-        checkThresholds(s)
-        updateResetAlarm(reset: s.fiveHour.reset, enabled: resetAlarmEnabled)
+        checkThresholds(s, codex: codex)
+        updateResetAlarm(reset: s.claude.fiveHour.reset, enabled: resetAlarmEnabled)
 
         // Detail lines.
-        fiveDetailItem.title = s.fiveHour.detail.isEmpty ? "5-hour: no data yet" : "5-hour: \(s.fiveHour.detail)"
-        fiveResetItem.title = resetLine(s.fiveHour.reset, clock: true)
-        weeklyDetailItem.title = s.weekly.detail.isEmpty ? "Weekly: no data yet" : "Weekly: \(s.weekly.detail)"
-        weeklyResetItem.title = resetLine(s.weekly.reset, clock: false)
+        fiveDetailItem.title = s.claude.fiveHour.detail.isEmpty ? "Claude 5-hour: no data yet" : "Claude 5-hour: \(s.claude.fiveHour.detail)"
+        fiveResetItem.title = resetLine(s.claude.fiveHour.reset, clock: true)
+        weeklyDetailItem.title = s.claude.weekly.detail.isEmpty ? "Claude weekly: no data yet" : "Claude weekly: \(s.claude.weekly.detail)"
+        weeklyResetItem.title = resetLine(s.claude.weekly.reset, clock: false)
+        codexFiveDetailItem.title = codex.fiveHour.detail.isEmpty ? "Codex 5-hour: no data yet" : "Codex 5-hour: \(codex.fiveHour.detail)"
+        codexFiveResetItem.title = resetLine(codex.fiveHour.reset, clock: true)
+        codexWeeklyDetailItem.title = codex.weekly.detail.isEmpty ? "Codex weekly: no data yet" : "Codex weekly: \(codex.weekly.detail)"
+        codexWeeklyResetItem.title = resetLine(codex.weekly.reset, clock: false)
         updatedItem.title = "Updated " + ago(s.lastUpdate)
+
+        updateCodexVersionMenu(models: s.codexModels)
 
         // Settings checkmarks.
         showFiveItem.state = showFive ? .on : .off
         showWeeklyItem.state = showWeekly ? .on : .off
-        showClaudeItem.state = showClaude ? .on : .off
+        showCodexFiveItem.state = showCodexFive ? .on : .off
+        showCodexWeeklyItem.state = showCodexWeekly ? .on : .off
+        showClaudeItem.state = showLabels ? .on : .off
         showResetsAtItem.state = showResetsAt ? .on : .off
         showResetCountdownItem.state = showResetCountdown ? .on : .off
         resetAlarmItem.state = resetAlarmEnabled ? .on : .off
@@ -325,9 +454,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         configureRenderTimer()
     }
 
+    /// Rebuilds the Codex version submenu when the model list changes, and
+    /// keeps the checkmark on the stored selection (falling back to the
+    /// account lane when the selected model is absent from the payload).
+    private func updateCodexVersionMenu(models: [CodexModel]) {
+        let ids = models.map { $0.id }
+        if ids != codexVersionMenuIds {
+            codexVersionMenuIds = ids
+            codexVersionMenu.removeAllItems()
+            let account = NSMenuItem(title: "Account limit", action: #selector(selectCodexVersion), keyEquivalent: "")
+            account.target = self
+            account.representedObject = ""
+            codexVersionMenu.addItem(account)
+            if !models.isEmpty { codexVersionMenu.addItem(.separator()) }
+            for model in models {
+                let item = NSMenuItem(title: model.label, action: #selector(selectCodexVersion), keyEquivalent: "")
+                item.target = self
+                item.representedObject = model.id
+                codexVersionMenu.addItem(item)
+            }
+        }
+        let selected = UserDefaults.standard.string(forKey: kCodexVersionId) ?? ""
+        let selectionPresent = ids.contains(selected)
+        for item in codexVersionMenu.items {
+            guard let id = item.representedObject as? String else { continue }
+            item.state = (id == selected && selectionPresent) || (id.isEmpty && !selectionPresent) ? .on : .off
+        }
+    }
+
     private func configureRenderTimer() {
         let defaults = UserDefaults.standard
-        let fivePercent = percent(state.snapshot.fiveHour.value) ?? 0
+        let fivePercent = percent(state.snapshot.claude.fiveHour.value) ?? 0
         let countdownVisible = defaults.bool(forKey: kShowResetCountdown)
             && defaults.bool(forKey: kShowFiveHour)
             && fivePercent >= 100
@@ -447,18 +604,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     /// Notifies once when a figure crosses the critical line upward. The first
     /// reading only establishes a baseline so a relaunch at an already-high figure
     /// does not spam a notification.
-    private func checkThresholds(_ s: Snapshot) {
-        maybeNotify(label: "5-hour", pct: percent(s.fiveHour.value), last: &lastFivePercent)
-        maybeNotify(label: "Weekly", pct: percent(s.weekly.value), last: &lastWeeklyPercent)
+    private func checkThresholds(_ s: Snapshot, codex: (fiveHour: Metric, weekly: Metric)) {
+        maybeNotify(provider: "Claude", label: "5-hour", pct: percent(s.claude.fiveHour.value), last: &lastFivePercent)
+        maybeNotify(provider: "Claude", label: "Weekly", pct: percent(s.claude.weekly.value), last: &lastWeeklyPercent)
+        maybeNotify(provider: "Codex", label: "5-hour", pct: percent(codex.fiveHour.value), last: &lastCodexFivePercent)
+        maybeNotify(provider: "Codex", label: "Weekly", pct: percent(codex.weekly.value), last: &lastCodexWeeklyPercent)
     }
 
-    private func maybeNotify(label: String, pct: Int?, last: inout Int?) {
+    private func maybeNotify(provider: String, label: String, pct: Int?, last: inout Int?) {
         guard let pct = pct else { return }
         defer { last = pct }
         guard let prev = last else { return } // baseline only on first reading
         if prev < critPercent && pct >= critPercent {
-            postNotification(title: "Claude usage high",
-                             body: "\(label) limit at \(pct)% used.")
+            postNotification(title: "\(provider) usage high",
+                             body: "\(provider) \(label) limit at \(pct)% used.")
         }
     }
 
@@ -507,6 +666,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         if let url = URL(string: "https://claude.ai/new#settings/usage") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc private func openChatGPTUsage() {
+        if let url = URL(string: "https://chatgpt.com/codex/settings/usage") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func toggleCodexFiveHour() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: kShowCodexFiveHour), forKey: kShowCodexFiveHour)
+        render()
+    }
+
+    @objc private func toggleCodexWeekly() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: kShowCodexWeekly), forKey: kShowCodexWeekly)
+        render()
+    }
+
+    @objc private func selectCodexVersion(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(id, forKey: kCodexVersionId)
+        render()
     }
 
     @objc private func toggleFiveHour() {
@@ -636,6 +819,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
         var contentLength = 0
         var host = ""
+        var origin = ""
         for line in lines.dropFirst() {
             let kv = line.split(separator: ":", maxSplits: 1)
             guard kv.count == 2 else { continue }
@@ -647,6 +831,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                 contentLength = n
             } else if key == "host" {
                 host = value
+            } else if key == "origin" {
+                origin = value
             }
         }
 
@@ -654,48 +840,71 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let available = data.endIndex - bodyStart
         if available < contentLength { return .incomplete } // body not complete yet
         let body = data.subdata(in: bodyStart..<(bodyStart + contentLength))
-        return .ready(HTTPRequest(method: method, path: path, host: host, body: body))
+        return .ready(HTTPRequest(method: method, path: path, host: host, origin: origin, body: body))
     }
 
     /// Routes the request and writes a response. Requests with an unexpected Host
     /// header are rejected to block DNS rebinding from other origins.
     private func handle(_ request: HTTPRequest, on connection: NWConnection) {
         guard allowedHosts.contains(request.host.lowercased()) else {
-            send(status: "403 Forbidden", body: "forbidden", on: connection)
+            send(status: "403 Forbidden", body: "forbidden", origin: request.origin, on: connection)
             return
         }
 
         switch (request.method, request.path) {
         case ("OPTIONS", _):
-            send(status: "204 No Content", body: "", on: connection)
+            send(status: "204 No Content", body: "", origin: request.origin, on: connection)
         case ("GET", "/health"):
-            send(status: "200 OK", body: "ok", on: connection)
+            send(status: "200 OK", body: "ok", origin: request.origin, on: connection)
         case ("POST", "/usage"):
             if let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] {
-                func group(_ key: String) -> (value: String, detail: String, reset: String)? {
-                    guard let d = json[key] as? [String: Any] else { return nil }
+                func group(_ node: Any?) -> UsageState.Group? {
+                    guard let d = node as? [String: Any] else { return nil }
                     return (d["value"] as? String ?? "", d["detail"] as? String ?? "", d["reset"] as? String ?? "")
                 }
-                let fiveHour = group("five_hour")
-                let weekly = group("weekly")
-                if fiveHour != nil || weekly != nil {
-                    state.update(fiveHour: fiveHour, weekly: weekly)
+                let provider = (json["provider"] as? String) ?? "claude"
+                let fiveHour = group(json["five_hour"])
+                let weekly = group(json["weekly"])
+                var rendered = false
+                if provider == "codex" {
+                    var models: [(id: String, label: String, fiveHour: UsageState.Group?, weekly: UsageState.Group?)] = []
+                    if let arr = json["models"] as? [[String: Any]] {
+                        for m in arr.prefix(10) {
+                            guard let id = m["id"] as? String, let label = m["label"] as? String else { continue }
+                            let f = group(m["five_hour"])
+                            let w = group(m["weekly"])
+                            if f != nil || w != nil { models.append((id, label, f, w)) }
+                        }
+                    }
+                    if fiveHour != nil || weekly != nil || !models.isEmpty {
+                        state.updateCodex(fiveHour: fiveHour, weekly: weekly, models: models)
+                        rendered = true
+                    }
+                } else if provider == "claude" {
+                    if fiveHour != nil || weekly != nil {
+                        state.updateClaude(fiveHour: fiveHour, weekly: weekly)
+                        rendered = true
+                    }
+                }
+                if rendered {
                     DispatchQueue.main.async { [weak self] in self?.render() }
                 }
             }
-            send(status: "200 OK", body: "ok", on: connection)
+            send(status: "200 OK", body: "ok", origin: request.origin, on: connection)
         default:
-            send(status: "404 Not Found", body: "", on: connection)
+            send(status: "404 Not Found", body: "", origin: request.origin, on: connection)
         }
     }
 
-    /// Writes a response and closes the connection. CORS is locked to the claude.ai
-    /// origin so other web origins cannot drive the local server from a page.
-    private func send(status: String, body: String, on connection: NWConnection) {
+    /// Writes a response and closes the connection. CORS is locked to the known
+    /// provider origins so other web origins cannot drive the local server from
+    /// a page: the request Origin is echoed back only when it is allow-listed.
+    private func send(status: String, body: String, origin: String = "", on connection: NWConnection) {
+        let corsOrigin = allowedOrigins.contains(origin) ? origin : defaultOrigin
         let bodyData = Data(body.utf8)
         let head = """
         HTTP/1.1 \(status)\r
-        Access-Control-Allow-Origin: \(allowedOrigin)\r
+        Access-Control-Allow-Origin: \(corsOrigin)\r
         Access-Control-Allow-Methods: POST, GET, OPTIONS\r
         Access-Control-Allow-Headers: Content-Type\r
         Content-Type: text/plain\r

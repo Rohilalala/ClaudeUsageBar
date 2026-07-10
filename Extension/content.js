@@ -84,7 +84,7 @@ if (document.documentElement.dataset.claudeUsageBar === "active") {
       return; // signed out, offline, transient error: try again next tick
     }
 
-    const payload = {};
+    const payload = { provider: "claude" };
     const five = metric(usage.five_hour, clockReset);
     const weekly = metric(usage.seven_day, weekdayReset);
     if (five) payload.five_hour = five;

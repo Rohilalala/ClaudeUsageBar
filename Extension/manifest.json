@@ -2,10 +2,11 @@
   "manifest_version": 3,
   "name": "ClaudeUsageBar",
   "version": "1.0.0",
-  "description": "Reads your Claude.ai usage figure from your own logged-in session and relays it to the ClaudeUsageBar menu bar app over localhost.",
+  "description": "Reads your Claude.ai and ChatGPT Codex usage figures from your own logged-in sessions and relays them to the ClaudeUsageBar menu bar app over localhost.",
   "permissions": ["scripting"],
   "host_permissions": [
     "https://claude.ai/*",
+    "https://chatgpt.com/*",
     "http://127.0.0.1:8787/*"
   ],
   "background": {
@@ -15,6 +16,11 @@
     {
       "matches": ["https://claude.ai/*"],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content-chatgpt.js"],
       "run_at": "document_idle"
     }
   ]
